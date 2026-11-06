@@ -1,0 +1,86 @@
+name: 构建并发布
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: macos-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 选择 Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: 编译
+        run: make
+
+      - name: 检查 dylib
+        run: |
+          set -euo pipefail
+          file build/picsave.dylib
+          file build/picsave.dylib | grep -q "Mach-O 64-bit dynamically linked shared library arm64"
+          otool -L build/picsave.dylib
+          if otool -L build/picsave.dylib | grep -Eiq 'substrate|ellekit|CydiaSubstrate'; then
+            echo "dylib 不能链接 Substrate 或 ElleKit" >&2
+            exit 1
+          fi
+          otool -L build/picsave.dylib | grep -q "@rpath/picsave.dylib"
+          otool -l build/picsave.dylib | grep -A4 LC_BUILD_VERSION | grep -q "minos 14.0"
+
+      - name: 读取版本号
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "VERSION 必须是 x.y.z，当前是: ${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=picsave_${version}#${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: picsave-${{ steps.version.outputs.version }}-${{ github.run_number }}
+          path: build/picsave.dylib
+
+      - name: 写发布说明
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          ## picsave ${RELEASE_VERSION}
+
+          免越狱、无根的 iOS 通用图片下载插件。用 TrollFools 注入任意 App，无需越狱，也不依赖 Substrate。
+
+          ### 下载
+
+          下载 \`picsave.dylib\`，可以直接交给 TrollFools 注入。
+
+          ### 使用
+
+          1. 用 TrollFools 把 \`picsave.dylib\` 注入目标 App，然后重新打开它。
+          2. 长按图片，点底部的「下载」。
+          3. 图片保存在该 App 沙盒的 \`Documents/picsave\`。
+          EOF
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" build/picsave.dylib \
+            --target "${GITHUB_SHA}" \
+            --title "$RELEASE_TAG" \
+            --notes-file release-notes.md \
+            --latest
