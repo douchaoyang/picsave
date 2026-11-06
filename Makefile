@@ -32,6 +32,7 @@ LDFLAGS := \
 	-framework UIKit \
 	-framework CoreGraphics \
 	-framework QuartzCore \
+	-framework ImageIO \
 	-framework WebKit
 
 .PHONY: all clean

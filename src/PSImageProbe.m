@@ -127,14 +127,21 @@ static BOOL PSIsOwnOverlay(UIView *view) {
 }
 
 + (NSString *)webImageScriptAtPoint:(CGPoint)point {
-    // 只传入坐标，脚本里没有其他格式化占位符。
+    // 只传入坐标和最小边长，脚本里没有其他格式化占位符。
     NSString *script =
         @"(function(){"
-        @"var x=%f,y=%f;"
+        @"var x=%f,y=%f,minSide=%f;"
         @"function absURL(u){try{return new URL(u,document.baseURI).href;}catch(e){return '';}}"
         @"function isHTTP(u){return /^https?:/i.test(u||'');}"
-        @"function isBig(n){if(!n||!n.getBoundingClientRect)return false;var r=n.getBoundingClientRect();return Math.min(r.width,r.height)>=80;}"
-        @"function firstHTTP(bg){"
+        @"function isBig(n){"
+        @"if(!n||!n.getBoundingClientRect)return false;"
+        @"var r=n.getBoundingClientRect();"
+        @"return Math.min(r.width,r.height)>=minSide&&x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom;}"
+        @"function firstHTTP(list){for(var i=0;i<list.length;i++){var abs=absURL(list[i]||'');if(isHTTP(abs))return abs;}return '';}"
+        @"function fromImg(n){"
+        @"if(!n||String(n.tagName)!=='IMG'||!isBig(n))return '';"
+        @"return firstHTTP([n.currentSrc,n.src,n.getAttribute('data-src'),n.getAttribute('data-original')]);}"
+        @"function fromBackground(bg){"
         @"if(!bg||bg==='none')return '';"
         @"var start=0;"
         @"while(start<bg.length){"
@@ -144,15 +151,22 @@ static BOOL PSIsOwnOverlay(UIView *view) {
         @"var end=j;while(end<bg.length){var ch=bg.charAt(end);if(quote){if(ch===quote)break;}else if(ch===')')break;end++;}"
         @"var abs=absURL(bg.substring(j,end).trim());if(isHTTP(abs))return abs;start=end+1;}"
         @"return '';}"
-        @"var el=document.elementFromPoint(x,y);var n=el;"
-        @"while(n&&n!==document.documentElement){"
-        @"if(n.tagName==='IMG'&&isBig(n)){var src=absURL(n.currentSrc||n.src||'');if(isHTTP(src))return src;}"
-        @"n=n.parentElement;}"
-        @"n=el;while(n&&n!==document.documentElement){"
-        @"if(isBig(n)){var found=firstHTTP(getComputedStyle(n).backgroundImage);if(found)return found;}"
-        @"n=n.parentElement;}"
+        @"var nodes=[];"
+        @"if(document.elementsFromPoint){nodes=document.elementsFromPoint(x,y)||[];}"
+        @"else{var one=document.elementFromPoint(x,y);if(one)nodes=[one];}"
+        @"var index,node,found;"
+        @"for(index=0;index<nodes.length;index++){"
+        @"node=nodes[index];"
+        @"while(node&&node!==document.documentElement){found=fromImg(node);if(found)return found;node=node.parentElement;}"
+        @"}"
+        @"for(index=0;index<nodes.length;index++){"
+        @"node=nodes[index];"
+        @"while(node&&node!==document.documentElement){"
+        @"if(isBig(node)){found=fromBackground(getComputedStyle(node).backgroundImage);if(found)return found;}"
+        @"node=node.parentElement;}"
+        @"}"
         @"return '';})()";
-    return [NSString stringWithFormat:script, point.x, point.y];
+    return [NSString stringWithFormat:script, point.x, point.y, kPSMinimumImageSide];
 }
 
 + (void)resolveWebView:(WKWebView *)webView
@@ -190,6 +204,56 @@ static BOOL PSIsOwnOverlay(UIView *view) {
               }];
 }
 
++ (void)collectFrontWebViewInView:(UIView *)view
+                            point:(CGPoint)point
+                           window:(UIWindow *)window
+                             best:(WKWebView *__strong *)best {
+    if (!view || view.hidden || view.alpha < 0.01 || PSIsOwnOverlay(view)) {
+        return;
+    }
+    if ([view isKindOfClass:[WKWebView class]]) {
+        CGRect rect = [view convertRect:view.bounds toView:window];
+        if (CGRectContainsPoint(rect, point)) {
+            *best = (WKWebView *)view;
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        [self collectFrontWebViewInView:subview point:point window:window best:best];
+    }
+}
+
++ (WKWebView *)frontmostWebViewAtPoint:(CGPoint)point inWindow:(UIWindow *)window {
+    WKWebView *best = nil;
+    [self collectFrontWebViewInView:window point:point window:window best:&best];
+    return best;
+}
+
++ (PSImageSource *)sourceForImageView:(UIImageView *)imageView {
+    if (!imageView.image) {
+        return nil;
+    }
+    PSImageSource *source = [[PSImageSource alloc] init];
+    source.remoteURL = PSRemoteURLNearView(imageView);
+    source.image = imageView.image;
+    return source;
+}
+
++ (BOOL)containsLargeImageViewAtPoint:(CGPoint)point inWindow:(UIWindow *)window {
+    if (!window) {
+        return NO;
+    }
+    UIView *hit = [window hitTest:point withEvent:nil];
+    if (!hit) {
+        return NO;
+    }
+    for (UIView *view = hit; view; view = view.superview) {
+        if (PSIsOwnOverlay(view)) {
+            return NO;
+        }
+    }
+    return [self imageViewAtPoint:point inWindow:window hit:hit] != nil;
+}
+
 + (void)resolveAtPoint:(CGPoint)point
               inWindow:(UIWindow *)window
             completion:(void (^)(PSImageSource *_Nullable source))completion {
@@ -220,22 +284,27 @@ static BOOL PSIsOwnOverlay(UIView *view) {
         }
     }
 
-    WKWebView *webView = [self webViewContainingHit:hit];
+    UIImageView *imageView = hit ? [self imageViewAtPoint:point inWindow:window hit:hit] : nil;
+    WKWebView *webView = hit ? [self webViewContainingHit:hit] : nil;
+    if (!webView) {
+        webView = [self frontmostWebViewAtPoint:point inWindow:window];
+    }
     if (webView) {
-        [self resolveWebView:webView atPoint:point inWindow:window completion:finish];
+        [self resolveWebView:webView
+                      atPoint:point
+                     inWindow:window
+                   completion:^(PSImageSource *source) {
+                     if (PSIsHTTPURL(source.remoteURL)) {
+                         source.image = nil;
+                         finish(source);
+                         return;
+                     }
+                     finish([self sourceForImageView:imageView]);
+                   }];
         return;
     }
 
-    UIImageView *imageView = [self imageViewAtPoint:point inWindow:window hit:hit];
-    if (!imageView.image) {
-        finish(nil);
-        return;
-    }
-
-    PSImageSource *source = [[PSImageSource alloc] init];
-    source.remoteURL = PSRemoteURLNearView(imageView);
-    source.image = imageView.image;
-    finish(source);
+    finish([self sourceForImageView:imageView]);
 }
 
 @end

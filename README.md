@@ -1,50 +1,37 @@
 # picsave
 
-免越狱、无根的 iOS 通用图片下载插件。把 `picsave.dylib` 用 [TrollFools](https://github.com/Lessica/TrollFools) 注入任意 App 后，长按图片就能保存到这个 App 自己的沙盒里。不需要越狱，也不依赖 CydiaSubstrate 或 ElleKit。
+iOS 通用图片下载插件。把 `picsave.dylib` 用 [TrollFools](https://github.com/Lessica/TrollFools) 注入，长按图片就能保存到应用自己的沙盒里，放在沙盒里的原因是因为作者不喜欢放在相册里。
 
-Rootless image downloader for any iOS app. Inject the dylib with TrollFools on TrollStore. No jailbreak.
+Rootless image downloader for any iOS app. Inject the dylib with TrollFools.
 
 ## 适合这些场景
 
-- 想在微信、微博、小红书、浏览器或其他 App 里长按保存图片
+- 想在一些没有图片下载插件的应用里长按保存图片
 - 只有 TrollStore / TrollFools，没有越狱
-- 需要一个可注入任意 App 的无根 dylib，而不是只对某一个 App 生效的越狱插件
+- 需要一个可注入任意应用的无根 dylib
 
 ## 下载
 
-发布文件在 [Releases](../../releases)，只有 `picsave.dylib`，下载后可以直接注入。
-
-自己发布：打开 GitHub 的 Actions，选择「构建并发布」，点击 Run workflow。版本号读取仓库里的 `VERSION`，不需要手填。完成后 Release 里会有 `picsave.dylib`，标签形如 `picsave_1.0.0#12`。
+[Releases](../../releases) 下载后可以直接注入。
 
 ## 环境
 
 - iOS 14 或更高版本
 - 已安装 TrollStore，并用其中的 TrollFools 注入
-- 不需要越狱，也不要把它装进 MobileSubstrate / ElleKit
+- 已在小草、ONE 这两个应用的 iOS 17.0 上通过测试
 
 ## 注入
 
-1. 用 TrollFools 选择要注入的 App。
-2. 选择 `picsave.dylib` 注入。
-3. 完全退出并重新打开该 App。
-
-每个 App 都要单独注入一次。注入后只在这个 App 里生效。
+每个应用都要单独注入一次。注入后只在这个应用里生效。
 
 ## 使用
 
-长按一张足够大的图片（短边至少 80pt）。屏幕底部滑出「下载 / 取消」。点「下载」后卡片收起，状态栏下方出现黑色圆角胶囊，带一圈浅灰边框，里面是绿色圆环和白色百分数。下载完成后圆环变成绿色实心圆，中间是对号，文字显示「完成」，停留 1.5 秒，再用 0.5 秒淡出。下载过程中点进度可以取消。同一时间只下载一张。
-
-能拿到图片地址时，按原始文件保存，动图不会被压成静图。地址来自 SDWebImage、YYWebImage，或网页里的 `img` 和 CSS 背景图。没有地址时，保存的是这张 `UIImageView` 里已经显示的图片：有透明通道存成 PNG，否则存成 JPEG。这不是屏幕截图。
-
-图标、头像和短边小于 80pt 的小图不会弹出下载卡片。
+长按一张足够大的图片（短边至少 80pt）。屏幕底部滑出「下载 / 取消」。下载过程中点进度可以取消。同一时间只下载一张。
+一些应用内已有长按事件的可能也不会弹出。
 
 ## 保存位置和文件名
 
-文件在当前 App 沙盒的 `Documents/picsave`。目录不存在时会自动创建。
-
-有原始名称时，名称和 6 位随机字母数字之间用 `-` 连接，例如 `banner-K7m2Qx.jpg`。没有可用的原始名称时，只有随机串和扩展名，例如 `K7m2Qx.jpg`。
-
-用「文件」App 或文件管理工具进入该 App 的文稿目录，即可找到 `picsave`。目标 App 如果没有打开文件共享，系统「文件」App 里可能看不到这个目录，但文件仍然在沙盒中。
+文件在当前应用沙盒的 `Documents/picsave`。目录不存在时会自动创建。
 
 ## 从源码构建
 
@@ -54,4 +41,6 @@ Rootless image downloader for any iOS app. Inject the dylib with TrollFools on T
 make
 ```
 
-产物是 arm64 动态库，最低系统 iOS 14，安装名为 `@rpath/picsave.dylib`。
+## 免责声明
+
+本项目仅供个人学习与研究。把动态库注入第三方应用可能违反该应用的服务条款，也可能引起闪退、功能异常或账号风险。作者不对因使用、注入或分发本插件造成的任何损失承担责任。保存下来的图片版权归原权利人所有，请在合法范围内使用。

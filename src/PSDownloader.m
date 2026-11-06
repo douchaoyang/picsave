@@ -3,6 +3,7 @@
 #import "PSImageProbe.h"
 #import "PSProgressHUD.h"
 
+#import <ImageIO/ImageIO.h>
 #import <string.h>
 
 static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -314,11 +315,60 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
     }
 }
 
++ (int)exifOrientationForImage:(UIImage *)image {
+    switch (image.imageOrientation) {
+        case UIImageOrientationUp:
+            return 1;
+        case UIImageOrientationDown:
+            return 3;
+        case UIImageOrientationLeft:
+            return 8;
+        case UIImageOrientationRight:
+            return 6;
+        case UIImageOrientationUpMirrored:
+            return 2;
+        case UIImageOrientationDownMirrored:
+            return 4;
+        case UIImageOrientationLeftMirrored:
+            return 5;
+        case UIImageOrientationRightMirrored:
+            return 7;
+    }
+    return 1;
+}
+
++ (NSData *)dataByWritingCGImage:(CGImageRef)image hasAlpha:(BOOL)hasAlpha orientation:(int)orientation {
+    NSMutableData *data = [NSMutableData data];
+    CFStringRef type = hasAlpha ? CFSTR("public.png") : CFSTR("public.jpeg");
+    CGImageDestinationRef destination = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, type, 1, NULL);
+    if (!destination) {
+        return nil;
+    }
+    NSMutableDictionary *properties = [NSMutableDictionary dictionary];
+    properties[(__bridge id)kCGImagePropertyOrientation] = @(orientation);
+    if (!hasAlpha) {
+        properties[(__bridge id)kCGImageDestinationLossyCompressionQuality] = @0.95;
+    }
+    CGImageDestinationAddImage(destination, image, (__bridge CFDictionaryRef)properties);
+    BOOL wrote = CGImageDestinationFinalize(destination);
+    CFRelease(destination);
+    return wrote && data.length > 0 ? data : nil;
+}
+
 + (NSData *)encodedDataForImage:(UIImage *)image png:(BOOL *)png {
     if (image.size.width < 1 || image.size.height < 1) {
         return nil;
     }
     BOOL hasAlpha = [self imageHasAlpha:image];
+    if (image.CGImage) {
+        NSData *written = [self dataByWritingCGImage:image.CGImage hasAlpha:hasAlpha orientation:[self exifOrientationForImage:image]];
+        if (written.length > 0) {
+            if (png) {
+                *png = hasAlpha;
+            }
+            return written;
+        }
+    }
     UIGraphicsImageRendererFormat *format = [[UIGraphicsImageRendererFormat alloc] init];
     format.opaque = !hasAlpha;
     format.scale = image.scale > 0 ? image.scale : 1;

@@ -20,6 +20,9 @@ NS_INLINE BOOL PSIsHTTPURL(NSURL *_Nullable url) {
 
 @interface PSImageProbe : NSObject
 
+/// 这个点是否落在短边至少 80pt 的 UIImageView 上。网页里的图不算。
++ (BOOL)containsLargeImageViewAtPoint:(CGPoint)point inWindow:(UIWindow *)window;
+
 + (void)resolveAtPoint:(CGPoint)point
               inWindow:(UIWindow *)window
             completion:(void (^)(PSImageSource *_Nullable source))completion;
