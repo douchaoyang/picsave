@@ -8,11 +8,30 @@
 
 static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-@interface PSDownloader () <NSURLSessionDownloadDelegate>
+@interface PSDownloader () <NSURLSessionDownloadDelegate, NSURLSessionDataDelegate>
 
 @property(nonatomic, assign, readwrite, getter=isBusy) BOOL busy;
 @property(nonatomic, strong) NSURLSession *session;
 @property(nonatomic, strong) NSURLSessionDownloadTask *task;
+@property(nonatomic, strong) NSURLSession *videoSession;
+@property(nonatomic, strong) NSURLSessionDataTask *videoTask;
+@property(nonatomic, strong) dispatch_queue_t videoIOQueue;
+@property(nonatomic, strong) NSFileHandle *videoHandle;
+@property(nonatomic, strong) NSMutableData *videoHeaderBuffer;
+@property(nonatomic, copy) NSURL *videoURL;
+@property(nonatomic, copy) NSString *partialPath;
+@property(nonatomic, copy) NSString *partialMarkerPath;
+@property(nonatomic, copy) NSString *videoBaseName;
+@property(nonatomic, copy) NSString *videoExtension;
+@property(nonatomic, assign) int64_t videoResumeOffset;
+@property(nonatomic, assign) int64_t videoReceived;
+@property(nonatomic, assign) int64_t videoExpectedTotal;
+@property(nonatomic, assign) BOOL videoHeaderChecked;
+@property(nonatomic, assign) BOOL videoDeletePartial;
+@property(nonatomic, assign) BOOL videoRetryWithoutRange;
+@property(nonatomic, assign) BOOL videoRetriedWithoutRange;
+@property(nonatomic, assign) BOOL videoReplaceFromStart;
+@property(atomic, assign) BOOL videoWriteFailed;
 @property(nonatomic, strong) PSProgressHUD *hud;
 @property(nonatomic, assign) BOOL settled;
 @property(nonatomic, assign) BOOL pendingSuccess;
@@ -44,6 +63,28 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
     return _session;
 }
 
+- (NSURLSession *)videoSession {
+    if (!_videoSession) {
+        NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        configuration.HTTPCookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+        configuration.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyAlways;
+        configuration.HTTPShouldSetCookies = YES;
+        configuration.URLCredentialStorage = [NSURLCredentialStorage sharedCredentialStorage];
+        configuration.timeoutIntervalForRequest = 60;
+        // 视频可能很大。拉长整次传输的上限，空闲超过 60 秒仍会失败。不用后台会话。
+        configuration.timeoutIntervalForResource = 7 * 24 * 60 * 60;
+        _videoSession = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:[NSOperationQueue mainQueue]];
+    }
+    return _videoSession;
+}
+
+- (dispatch_queue_t)videoIOQueue {
+    if (!_videoIOQueue) {
+        _videoIOQueue = dispatch_queue_create("picsave.video.io", DISPATCH_QUEUE_SERIAL);
+    }
+    return _videoIOQueue;
+}
+
 #pragma mark - 路径与命名
 
 - (NSString *)picsaveDirectory {
@@ -56,6 +97,22 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
 
 - (BOOL)ensurePicsaveDirectory {
     NSString *directory = [self picsaveDirectory];
+    if (directory.length == 0) {
+        return NO;
+    }
+    return [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+}
+
+- (NSString *)videoDirectory {
+    NSString *root = [self picsaveDirectory];
+    if (root.length == 0) {
+        return nil;
+    }
+    return [root stringByAppendingPathComponent:@"v"];
+}
+
+- (BOOL)ensureVideoDirectory {
+    NSString *directory = [self videoDirectory];
     if (directory.length == 0) {
         return NO;
     }
@@ -201,7 +258,10 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
 }
 
 - (NSString *)uniquePathWithBaseName:(NSString *)baseName extension:(NSString *)extension {
-    NSString *directory = [self picsaveDirectory];
+    return [self uniquePathWithBaseName:baseName extension:extension directory:[self picsaveDirectory]];
+}
+
+- (NSString *)uniquePathWithBaseName:(NSString *)baseName extension:(NSString *)extension directory:(NSString *)directory {
     if (directory.length == 0 || extension.length == 0) {
         return nil;
     }
@@ -246,6 +306,16 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
                               weakSelf.hud = nil;
                             }];
 
+    if (source.kind == PSMediaKindVideo) {
+        self.videoRetriedWithoutRange = NO;
+        if (![self ensureVideoDirectory] || ![self preparePartialFileForURL:source.remoteURL]) {
+            [self finishWithFailure];
+            return;
+        }
+        [self beginVideoTaskAllowingRange:YES];
+        return;
+    }
+
     if (![self ensurePicsaveDirectory]) {
         [self finishWithFailure];
         return;
@@ -275,6 +345,9 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
     self.pendingSuccess = NO;
     [self.task cancel];
     self.task = nil;
+    [self.videoTask cancel];
+    self.videoTask = nil;
+    [self closeVideoHandleWaiting:YES];
 }
 
 - (void)finishWithSuccess {
@@ -283,6 +356,7 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
     }
     self.settled = YES;
     self.task = nil;
+    self.videoTask = nil;
     [self.hud completeAndDismiss];
 }
 
@@ -293,7 +367,334 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
     self.settled = YES;
     [self.task cancel];
     self.task = nil;
+    [self.videoTask cancel];
+    self.videoTask = nil;
+    [self closeVideoHandleWaiting:YES];
     [self.hud failAndDismiss];
+}
+
+#pragma mark - 视频
+
++ (NSString *)shortHashForString:(NSString *)string {
+    uint64_t hash = 14695981039346656037ULL;
+    const char *bytes = string.UTF8String;
+    if (!bytes) {
+        return @"00000000";
+    }
+    for (const unsigned char *cursor = (const unsigned char *)bytes; *cursor; cursor++) {
+        hash ^= *cursor;
+        hash *= 1099511628211ULL;
+    }
+    return [NSString stringWithFormat:@"%08llx", (unsigned long long)(hash & 0xffffffffULL)];
+}
+
++ (BOOL)dataLooksLikeMP4OrMOV:(NSData *)data {
+    if (data.length < 8) {
+        return NO;
+    }
+    const unsigned char *bytes = data.bytes;
+    return memcmp(bytes + 4, "ftyp", 4) == 0;
+}
+
++ (BOOL)MIMETypeAllowsVideoFile:(NSString *)mimeType {
+    if (mimeType.length == 0) {
+        return YES;
+    }
+    NSString *lower = mimeType.lowercaseString;
+    NSRange separator = [lower rangeOfString:@";"];
+    if (separator.location != NSNotFound) {
+        lower = [lower substringToIndex:separator.location];
+    }
+    lower = [lower stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [lower isEqualToString:@"video/mp4"] || [lower isEqualToString:@"video/quicktime"] || [lower isEqualToString:@"application/mp4"] ||
+           [lower isEqualToString:@"application/octet-stream"] || [lower isEqualToString:@"binary/octet-stream"];
+}
+
++ (int64_t)totalBytesFromContentRange:(NSString *)header {
+    if (header.length == 0) {
+        return -1;
+    }
+    NSRange slash = [header rangeOfString:@"/" options:NSBackwardsSearch];
+    if (slash.location == NSNotFound || slash.location + 1 >= header.length) {
+        return -1;
+    }
+    NSString *total = [[header substringFromIndex:slash.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (total.length == 0 || [total isEqualToString:@"*"]) {
+        return -1;
+    }
+    long long value = [total longLongValue];
+    return value > 0 ? value : -1;
+}
+
+- (void)closeVideoHandleWaiting:(BOOL)wait {
+    NSFileHandle *handle = self.videoHandle;
+    self.videoHandle = nil;
+    if (!handle) {
+        return;
+    }
+    void (^closeHandle)(void) = ^{
+      [handle closeAndReturnError:nil];
+    };
+    if (wait) {
+        dispatch_sync(self.videoIOQueue, closeHandle);
+    } else {
+        dispatch_async(self.videoIOQueue, closeHandle);
+    }
+}
+
+- (void)removePartialFiles {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if (self.partialPath.length > 0) {
+        [fileManager removeItemAtPath:self.partialPath error:nil];
+    }
+    if (self.partialMarkerPath.length > 0) {
+        [fileManager removeItemAtPath:self.partialMarkerPath error:nil];
+    }
+}
+
+- (void)removePartialIfEmpty {
+    if (self.partialPath.length == 0) {
+        return;
+    }
+    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:self.partialPath error:nil];
+    if (attributes.fileSize == 0) {
+        [self removePartialFiles];
+    }
+}
+
+- (BOOL)preparePartialFileForURL:(NSURL *)url {
+    NSString *extension = PSVideoFileExtension(url);
+    NSString *directory = [self videoDirectory];
+    if (extension.length == 0 || directory.length == 0) {
+        return NO;
+    }
+
+    NSString *baseName = [PSDownloader originalNameFromURL:url];
+    NSString *hash = [PSDownloader shortHashForString:url.absoluteString];
+    NSString *partialName = baseName.length > 0 ? [NSString stringWithFormat:@"%@-%@.%@.pspart", baseName, hash, extension]
+                                                 : [NSString stringWithFormat:@"%@.%@.pspart", hash, extension];
+    NSString *partialPath = [directory stringByAppendingPathComponent:partialName];
+    NSString *markerPath = [partialPath stringByAppendingString:@".url"];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *markedURL = [NSString stringWithContentsOfFile:markerPath encoding:NSUTF8StringEncoding error:nil];
+    unsigned long long offset = 0;
+    BOOL sameURL = [markedURL isEqualToString:url.absoluteString] && [fileManager fileExistsAtPath:partialPath];
+    if (sameURL) {
+        offset = [[fileManager attributesOfItemAtPath:partialPath error:nil] fileSize];
+    } else {
+        [fileManager removeItemAtPath:partialPath error:nil];
+        [fileManager removeItemAtPath:markerPath error:nil];
+    }
+    if (offset > 0 && offset < 12) {
+        [fileManager removeItemAtPath:partialPath error:nil];
+        offset = 0;
+    }
+    if (offset >= 12) {
+        NSFileHandle *reader = [NSFileHandle fileHandleForReadingAtPath:partialPath];
+        NSData *header = [reader readDataUpToLength:12 error:nil];
+        [reader closeAndReturnError:nil];
+        if (![PSDownloader dataLooksLikeMP4OrMOV:header]) {
+            [fileManager removeItemAtPath:partialPath error:nil];
+            offset = 0;
+        }
+    }
+    if (offset == 0) {
+        [fileManager removeItemAtPath:partialPath error:nil];
+        if (![fileManager createFileAtPath:partialPath contents:nil attributes:nil]) {
+            return NO;
+        }
+    }
+    if (![url.absoluteString writeToFile:markerPath atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+        if (offset == 0) {
+            [fileManager removeItemAtPath:partialPath error:nil];
+        }
+        return NO;
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:partialPath];
+    if (!handle) {
+        return NO;
+    }
+    if (offset > 0) {
+        NSError *seekError = nil;
+        if (![handle seekToEndReturningOffset:NULL error:&seekError]) {
+            [handle closeAndReturnError:nil];
+            return NO;
+        }
+    }
+
+    self.videoURL = url;
+    self.videoBaseName = baseName;
+    self.videoExtension = extension;
+    self.partialPath = partialPath;
+    self.partialMarkerPath = markerPath;
+    self.videoHandle = handle;
+    self.videoResumeOffset = (int64_t)offset;
+    self.videoReceived = 0;
+    self.videoExpectedTotal = 0;
+    self.videoHeaderChecked = offset > 0;
+    self.videoHeaderBuffer = [NSMutableData data];
+    self.videoDeletePartial = NO;
+    self.videoRetryWithoutRange = NO;
+    self.videoReplaceFromStart = NO;
+    self.videoWriteFailed = NO;
+    return YES;
+}
+
+- (BOOL)truncateVideoFile {
+    NSFileHandle *handle = self.videoHandle;
+    if (!handle) {
+        return NO;
+    }
+    __block BOOL truncated = NO;
+    dispatch_sync(self.videoIOQueue, ^{
+      NSError *error = nil;
+      truncated = [handle truncateAtOffset:0 error:&error] && [handle seekToOffset:0 error:&error];
+    });
+    return truncated;
+}
+
+- (BOOL)rewindPartialFile {
+    self.videoResumeOffset = 0;
+    self.videoReceived = 0;
+    self.videoExpectedTotal = 0;
+    self.videoHeaderChecked = NO;
+    self.videoHeaderBuffer = [NSMutableData data];
+    self.videoReplaceFromStart = NO;
+    return [self truncateVideoFile];
+}
+
+- (void)beginVideoTaskAllowingRange:(BOOL)allowRange {
+    if (!self.videoURL || !self.videoHandle) {
+        [self finishWithFailure];
+        return;
+    }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:self.videoURL];
+    request.HTTPShouldHandleCookies = YES;
+    if (allowRange && self.videoResumeOffset > 0) {
+        [request setValue:[NSString stringWithFormat:@"bytes=%lld-", self.videoResumeOffset] forHTTPHeaderField:@"Range"];
+    }
+    self.videoTask = [self.videoSession dataTaskWithRequest:request];
+    [self.videoTask resume];
+}
+
+- (void)updateVideoProgress {
+    if (self.videoExpectedTotal <= 0) {
+        [self.hud setIndeterminate];
+        return;
+    }
+    int64_t done = self.videoResumeOffset + self.videoReceived;
+    [self.hud setProgress:(float)done / (float)self.videoExpectedTotal];
+}
+
+- (void)appendVideoData:(NSData *)data {
+    if (data.length == 0 || self.settled) {
+        return;
+    }
+    if (self.videoWriteFailed) {
+        self.videoDeletePartial = YES;
+        [self.videoTask cancel];
+        return;
+    }
+    if (!self.videoHeaderChecked) {
+        if (!self.videoHeaderBuffer) {
+            self.videoHeaderBuffer = [NSMutableData data];
+        }
+        [self.videoHeaderBuffer appendData:data];
+        if (self.videoHeaderBuffer.length < 12) {
+            return;
+        }
+        if (![PSDownloader dataLooksLikeMP4OrMOV:self.videoHeaderBuffer]) {
+            BOOL replacing = self.videoReplaceFromStart;
+            self.videoReplaceFromStart = NO;
+            self.videoDeletePartial = !replacing;
+            [self.videoTask cancel];
+            return;
+        }
+        if (self.videoReplaceFromStart) {
+            if (![self truncateVideoFile]) {
+                self.videoDeletePartial = YES;
+                [self.videoTask cancel];
+                return;
+            }
+            self.videoResumeOffset = 0;
+            self.videoReplaceFromStart = NO;
+        }
+        data = [self.videoHeaderBuffer copy];
+        self.videoHeaderBuffer = nil;
+        self.videoHeaderChecked = YES;
+    }
+
+    self.videoReceived += data.length;
+    [self updateVideoProgress];
+    NSFileHandle *handle = self.videoHandle;
+    NSData *chunk = [data copy];
+    dispatch_async(self.videoIOQueue, ^{
+      NSError *error = nil;
+      if (handle && ![handle writeData:chunk error:&error]) {
+          self.videoWriteFailed = YES;
+      }
+    });
+}
+
+- (void)finishVideoDownloadWithError:(NSError *)error {
+    [self closeVideoHandleWaiting:YES];
+    self.videoTask = nil;
+    if (self.videoWriteFailed) {
+        self.videoDeletePartial = YES;
+    }
+
+    BOOL failed = error != nil || self.videoDeletePartial;
+    if (!failed) {
+        NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:self.partialPath error:nil];
+        unsigned long long size = attributes.fileSize;
+        if (size == 0) {
+            failed = YES;
+            self.videoDeletePartial = YES;
+        } else if (self.videoExpectedTotal > 0 && (int64_t)size < self.videoExpectedTotal) {
+            failed = YES;
+        }
+    }
+
+    if (failed) {
+        if (self.videoDeletePartial) {
+            [self removePartialFiles];
+        } else {
+            [self removePartialIfEmpty];
+        }
+        [self finishWithFailure];
+        return;
+    }
+
+    NSString *path = [self uniquePathWithBaseName:self.videoBaseName extension:self.videoExtension directory:[self videoDirectory]];
+    if (path.length == 0) {
+        [self finishWithFailure];
+        return;
+    }
+    NSError *moveError = nil;
+    BOOL moved = [[NSFileManager defaultManager] moveItemAtURL:[NSURL fileURLWithPath:self.partialPath] toURL:[NSURL fileURLWithPath:path] error:&moveError];
+    if (!moved) {
+        [self finishWithFailure];
+        return;
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:self.partialMarkerPath error:nil];
+    [self finishWithSuccess];
+}
+
+- (void)handleVideoTask:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (self.settled || task != self.videoTask) {
+        return;
+    }
+    if (self.videoRetryWithoutRange && !self.videoRetriedWithoutRange) {
+        self.videoRetriedWithoutRange = YES;
+        self.videoRetryWithoutRange = NO;
+        if ([self rewindPartialFile]) {
+            [self beginVideoTaskAllowingRange:NO];
+            return;
+        }
+        self.videoDeletePartial = YES;
+    }
+    [self finishVideoDownloadWithError:error];
 }
 
 #pragma mark - 内存图片
@@ -489,7 +890,67 @@ static NSString *const kPSRandomAlphabet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHI
     self.pendingSuccess = moved;
 }
 
+- (void)URLSession:(NSURLSession *)session
+              dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveResponse:(NSURLResponse *)response
+     completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+    if (dataTask != self.videoTask || self.settled) {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+
+    NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+    NSInteger status = http ? http.statusCode : 200;
+    if (status == 416) {
+        self.videoRetryWithoutRange = YES;
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    if (status >= 400) {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    if (http && ![PSDownloader MIMETypeAllowsVideoFile:http.MIMEType]) {
+        self.videoDeletePartial = YES;
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+    if (status == 200 && self.videoResumeOffset > 0) {
+        // 先确认新内容是视频，再覆盖已经下好的部分。
+        self.videoReplaceFromStart = YES;
+        self.videoHeaderChecked = NO;
+        self.videoHeaderBuffer = [NSMutableData data];
+        self.videoResumeOffset = 0;
+        self.videoReceived = 0;
+    }
+
+    self.videoExpectedTotal = 0;
+    if (http && status == 206) {
+        int64_t total = [PSDownloader totalBytesFromContentRange:[http valueForHTTPHeaderField:@"Content-Range"]];
+        if (total > 0) {
+            self.videoExpectedTotal = total;
+        } else if (http.expectedContentLength > 0) {
+            self.videoExpectedTotal = self.videoResumeOffset + http.expectedContentLength;
+        }
+    } else if (http && http.expectedContentLength > 0) {
+        self.videoExpectedTotal = http.expectedContentLength;
+    }
+    [self updateVideoProgress];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    if (dataTask != self.videoTask || self.settled) {
+        return;
+    }
+    [self appendVideoData:data];
+}
+
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (task == self.videoTask) {
+        [self handleVideoTask:task didCompleteWithError:error];
+        return;
+    }
     if (task != self.task || self.settled) {
         return;
     }

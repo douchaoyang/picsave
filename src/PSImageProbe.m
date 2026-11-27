@@ -4,7 +4,6 @@
 #import <objc/message.h>
 
 static const CGFloat kPSMinimumImageSide = 80.0;
-static const NSInteger kPSMaxAncestorHops = 8;
 static const NSInteger kPSMaxSearchDepth = 16;
 
 @implementation PSImageSource
@@ -97,21 +96,44 @@ static BOOL PSIsOwnOverlay(UIView *view) {
     }
 }
 
++ (BOOL)imageView:(UIImageView *)imageView containsLargeImageAtPoint:(CGPoint)point inWindow:(UIWindow *)window {
+    if (!imageView.image || !PSViewIsOnScreen(imageView)) {
+        return NO;
+    }
+    CGRect rect = [imageView convertRect:imageView.bounds toView:window];
+    if (!CGRectContainsPoint(rect, point)) {
+        return NO;
+    }
+    return MIN(CGRectGetWidth(rect), CGRectGetHeight(rect)) >= kPSMinimumImageSide;
+}
+
+/// 只认这次按到的图：触点视图自己、它的祖先，或它内部的图。不搜索祖先旁边的子视图。
 + (UIImageView *)imageViewAtPoint:(CGPoint)point inWindow:(UIWindow *)window hit:(UIView *)hit {
-    UIView *container = hit;
-    for (NSInteger hop = 0; container && hop < kPSMaxAncestorHops; hop++) {
-        if ([container isKindOfClass:[UIWindow class]]) {
+    if (!hit || [hit isKindOfClass:[UIWindow class]]) {
+        return nil;
+    }
+    for (UIView *view = hit; view; view = view.superview) {
+        if ([view isKindOfClass:[WKWebView class]]) {
+            return nil;
+        }
+        if ([view isKindOfClass:[UIWindow class]]) {
             break;
         }
-        UIImageView *levelBest = nil;
-        CGFloat levelArea = CGFLOAT_MAX;
-        [self collectImageViewsInView:container depth:0 point:point window:window best:&levelBest bestArea:&levelArea];
-        if (levelBest) {
-            return levelBest;
-        }
-        container = container.superview;
     }
-    return nil;
+
+    for (UIView *view = hit; view; view = view.superview) {
+        if ([view isKindOfClass:[UIWindow class]]) {
+            break;
+        }
+        if ([view isKindOfClass:[UIImageView class]] && [self imageView:(UIImageView *)view containsLargeImageAtPoint:point inWindow:window]) {
+            return (UIImageView *)view;
+        }
+    }
+
+    UIImageView *nested = nil;
+    CGFloat nestedArea = CGFLOAT_MAX;
+    [self collectImageViewsInView:hit depth:0 point:point window:window best:&nested bestArea:&nestedArea];
+    return nested;
 }
 
 + (WKWebView *)webViewContainingHit:(UIView *)hit {
@@ -151,20 +173,11 @@ static BOOL PSIsOwnOverlay(UIView *view) {
         @"var end=j;while(end<bg.length){var ch=bg.charAt(end);if(quote){if(ch===quote)break;}else if(ch===')')break;end++;}"
         @"var abs=absURL(bg.substring(j,end).trim());if(isHTTP(abs))return abs;start=end+1;}"
         @"return '';}"
-        @"var nodes=[];"
-        @"if(document.elementsFromPoint){nodes=document.elementsFromPoint(x,y)||[];}"
-        @"else{var one=document.elementFromPoint(x,y);if(one)nodes=[one];}"
-        @"var index,node,found;"
-        @"for(index=0;index<nodes.length;index++){"
-        @"node=nodes[index];"
-        @"while(node&&node!==document.documentElement){found=fromImg(node);if(found)return found;node=node.parentElement;}"
-        @"}"
-        @"for(index=0;index<nodes.length;index++){"
-        @"node=nodes[index];"
-        @"while(node&&node!==document.documentElement){"
+        @"var node=document.elementFromPoint(x,y);"
+        @"if(!node)return '';"
+        @"var found=fromImg(node);if(found)return found;"
+        @"if(node.parentElement){found=fromImg(node.parentElement);if(found)return found;}"
         @"if(isBig(node)){found=fromBackground(getComputedStyle(node).backgroundImage);if(found)return found;}"
-        @"node=node.parentElement;}"
-        @"}"
         @"return '';})()";
     return [NSString stringWithFormat:script, point.x, point.y, kPSMinimumImageSide];
 }
@@ -202,30 +215,6 @@ static BOOL PSIsOwnOverlay(UIView *view) {
                   completion(source);
                 });
               }];
-}
-
-+ (void)collectFrontWebViewInView:(UIView *)view
-                            point:(CGPoint)point
-                           window:(UIWindow *)window
-                             best:(WKWebView *__strong *)best {
-    if (!view || view.hidden || view.alpha < 0.01 || PSIsOwnOverlay(view)) {
-        return;
-    }
-    if ([view isKindOfClass:[WKWebView class]]) {
-        CGRect rect = [view convertRect:view.bounds toView:window];
-        if (CGRectContainsPoint(rect, point)) {
-            *best = (WKWebView *)view;
-        }
-    }
-    for (UIView *subview in view.subviews) {
-        [self collectFrontWebViewInView:subview point:point window:window best:best];
-    }
-}
-
-+ (WKWebView *)frontmostWebViewAtPoint:(CGPoint)point inWindow:(UIWindow *)window {
-    WKWebView *best = nil;
-    [self collectFrontWebViewInView:window point:point window:window best:&best];
-    return best;
 }
 
 + (PSImageSource *)sourceForImageView:(UIImageView *)imageView {
@@ -284,11 +273,7 @@ static BOOL PSIsOwnOverlay(UIView *view) {
         }
     }
 
-    UIImageView *imageView = hit ? [self imageViewAtPoint:point inWindow:window hit:hit] : nil;
-    WKWebView *webView = hit ? [self webViewContainingHit:hit] : nil;
-    if (!webView) {
-        webView = [self frontmostWebViewAtPoint:point inWindow:window];
-    }
+    WKWebView *webView = [self webViewContainingHit:hit];
     if (webView) {
         [self resolveWebView:webView
                       atPoint:point
@@ -299,12 +284,12 @@ static BOOL PSIsOwnOverlay(UIView *view) {
                          finish(source);
                          return;
                      }
-                     finish([self sourceForImageView:imageView]);
+                     finish(nil);
                    }];
         return;
     }
 
-    finish([self sourceForImageView:imageView]);
+    finish([self sourceForImageView:[self imageViewAtPoint:point inWindow:window hit:hit]]);
 }
 
 @end

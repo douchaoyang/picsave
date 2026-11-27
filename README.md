@@ -1,8 +1,8 @@
 # picsave
 
-iOS 通用图片下载插件。把 `picsave.dylib` 用 [TrollFools](https://github.com/Lessica/TrollFools) 注入，长按图片就能保存到应用自己的沙盒里，放在沙盒里的原因是因为作者不喜欢放在相册里。
+iOS 通用图片、视频下载插件。把 `picsave.dylib` 用 [TrollFools](https://github.com/Lessica/TrollFools) 注入，长按图片或 mp4、mov 视频就能保存到应用自己的沙盒里，放在沙盒里的原因是因为作者不喜欢放在相册里。
 
-Rootless image downloader for any iOS app. Inject the dylib with TrollFools.
+Rootless image and video downloader for any iOS app. Inject the dylib with TrollFools.
 
 ## 适合这些场景
 
@@ -26,12 +26,15 @@ Rootless image downloader for any iOS app. Inject the dylib with TrollFools.
 
 ## 使用
 
-长按一张足够大的图片（短边至少 80pt）。屏幕底部滑出「下载 / 取消」。下载过程中点进度可以取消。同一时间只下载一张。
+长按一张足够大的图片（短边至少 80pt），或一个 mp4、mov 视频。屏幕底部滑出「下载 / 取消」。下载过程中点进度可以取消。同一时间只下载一个。
+长按落在图片或视频上才会弹出。盖住它们的文字或其他控件不会弹出。
 一些应用内已有长按事件的可能也不会弹出。
 
 ## 保存位置和文件名
 
-文件在当前应用沙盒的 `Documents/picsave`。目录不存在时会自动创建。
+图片在当前应用沙盒的 `Documents/picsave`。目录不存在时会自动创建。
+
+视频在 `Documents/picsave/v`，目录不存在时会新建。下载直接写进这个目录，中断后再长按同一地址会从已下载的位置继续。只保存 mp4 和 mov。
 
 ## 从源码构建
 

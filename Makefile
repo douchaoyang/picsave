@@ -9,6 +9,7 @@ CC := $(shell xcrun --sdk iphoneos -f clang)
 SRCS := \
 	src/PSMain.m \
 	src/PSImageProbe.m \
+	src/PSVideoProbe.m \
 	src/PSDownloadCard.m \
 	src/PSProgressHUD.m \
 	src/PSDownloader.m

@@ -1,6 +1,7 @@
 #import "PSDownloadCard.h"
 #import "PSDownloader.h"
 #import "PSImageProbe.h"
+#import "PSVideoProbe.h"
 
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
@@ -151,16 +152,27 @@ static void PSInstallWebCallout(void) {
     }
 
     CGPoint point = [gesture locationInView:window];
-    [PSImageProbe resolveAtPoint:point
+    [PSVideoProbe resolveAtPoint:point
                         inWindow:window
                       completion:^(PSImageSource *source) {
-                        if (!source) {
-                            return;
-                        }
                         if ([PSDownloader sharedDownloader].isBusy || [PSDownloadCard isVisible]) {
                             return;
                         }
-                        [PSDownloadCard showInWindow:window source:source];
+                        if (source) {
+                            [PSDownloadCard showInWindow:window source:source];
+                            return;
+                        }
+                        [PSImageProbe resolveAtPoint:point
+                                            inWindow:window
+                                          completion:^(PSImageSource *imageSource) {
+                                            if (!imageSource) {
+                                                return;
+                                            }
+                                            if ([PSDownloader sharedDownloader].isBusy || [PSDownloadCard isVisible]) {
+                                                return;
+                                            }
+                                            [PSDownloadCard showInWindow:window source:imageSource];
+                                          }];
                       }];
 }
 
@@ -179,7 +191,7 @@ static void PSInstallWebCallout(void) {
         return NO;
     }
     CGPoint point = [gesture locationInView:window];
-    return [PSImageProbe containsLargeImageViewAtPoint:point inWindow:window];
+    return [PSImageProbe containsLargeImageViewAtPoint:point inWindow:window] || [PSVideoProbe containsVideoAtPoint:point inWindow:window];
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
